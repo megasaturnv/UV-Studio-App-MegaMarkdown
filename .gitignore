@@ -1,0 +1,13 @@
+# Build outputs
+*.app
+*.elf
+*.bin
+*.map
+markdown_viewer/markdown_assets.h
+
+# Python cache
+__pycache__/
+
+# Project-local toolchain (present on disk, not tracked)
+.toolchain/
+.toolchain-dl/
