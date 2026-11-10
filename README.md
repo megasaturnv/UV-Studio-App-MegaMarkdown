@@ -19,19 +19,21 @@ codec, and packed into the app's read-only flash assets. The radio app then
 decompresses only the lines it draws. Press `0` in the reader to switch to the
 radio's 3x5 font, which reflows the same text to 32 columns and nine rows.
 
-This folder vendors the v6.3.0 SDK and the ARM toolchain installer, so it builds
-without cloning the firmware. It is also usable inside the firmware tree as
-`App/apps/markdown_viewer/`.
+This project includes the ARM toolchain installer and an SDK fetch script, so a
+fresh checkout can build without cloning the firmware. It is also usable inside
+the firmware tree as `App/apps/markdown_viewer/`.
 
 ## Quick Start
 
 ```sh
 ./tools/fetch-toolchain.sh   # once; installs ./.toolchain (gitignored)
+python3 sdk/fetch_sdk.py     # once; downloads the v6.3.0 / API 3 SDK
 ./build.sh                   # or: make
 ```
 
 The toolchain step is skipped automatically if `arm-none-eabi-gcc` is already on
-`PATH` (or `TOOLCHAIN_ROOT` points at one). Output:
+`PATH` (or `TOOLCHAIN_ROOT` points at one). The SDK step leaves files with the
+expected hashes in place; use `--force` to download fresh copies. Output:
 
 ```
 markdown_viewer/MegaMarkdown.app
@@ -56,7 +58,7 @@ a free slot, then open the Apps menu on the radio (`F` then `7`), select
 │   ├── build.sh              compile, link, pack
 │   ├── MegaMarkdown.app      build output (gitignored)
 │   └── markdown_assets.*     generated at build time (gitignored)
-├── sdk/                      unmodified v6.3.0 SDK files (see sdk/README.md)
+├── sdk/                      fetch_sdk.py + downloaded v6.3.0 SDK files (gitignored)
 ├── test/                     host decoder/renderer comparison
 └── tools/fetch-toolchain.sh  installs ./.toolchain locally
 ```

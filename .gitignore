@@ -8,9 +8,10 @@ markdown_viewer/markdown_assets.h
 # Python cache
 __pycache__/
 
-# SDK
+# SDK (downloaded with sdk/fetch_sdk.py)
 sdk/*
 !sdk/README.md
+!sdk/fetch_sdk.py
 
 # Project-local toolchain (present on disk, not tracked)
 .toolchain/
