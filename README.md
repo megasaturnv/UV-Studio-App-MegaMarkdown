@@ -4,7 +4,11 @@
 [armel/uv-k1-k5v3-firmware-custom](https://github.com/armel/uv-k1-k5v3-firmware-custom)
 firmware, targeting **v6.3.0, ABI 1, API level 3**.
 
-With the amount of apps people are developing, I wanted a way to view their readme files on the device. I would have liked to develop this by hand, but due to time contraints AI has been used for most of the code and then reviewed. This will allow me more time to study API level 4. Over time I would like to minimise this app as much as possible to allow room for more markdown files. Most of the text below this line is AI-written, with a few tweaks.
+With the amount of apps people are developing, I wanted a way to view their readme files on the device. I would have liked to develop this by hand, but due to time constraints AI has been used for most of the code and then reviewed. This will allow me more time to study API level 4. Over time I would like to minimise this app as much as possible to allow room for more markdown files. Most of the text below this line is AI-written, with a few tweaks.
+
+![Main Menu](/images/Menu.png)
+![Markdown Normal Font](/images/MarkdownFileNormal.png)
+![Markdown Small Font](/images/MarkdownFileSmall.png)
 
 ---
 ## Adding Markdown Files
