@@ -50,6 +50,7 @@ a free slot, then open the Apps menu on the radio (`F` then `7`), select
 ├── build.sh                  convenience wrapper
 ├── Makefile                  make / make clean / make toolchain
 ├── markdown files/           source documents (*.md, *.markdown)
+│   └── download_armel_app_readmes.py  downloads app READMEs from the firmware repo
 ├── markdown_viewer/          the app itself
 │   ├── markdown_viewer_app.c entry point, list, reader, LZSS decoder
 │   ├── app.ld                linker script: everything in the 4 KiB overlay
@@ -72,6 +73,17 @@ files are ignored) and rebuild:
 make clean
 ./build.sh
 ```
+
+To probe the firmware repository and download each app's `README.md` as
+`<folder>.md`, run:
+
+```sh
+python3 "markdown files/download_armel_app_readmes.py"
+```
+
+The script checks every immediate folder under `App/apps/` (not the top-level
+`App/apps/README.md`), reports folders without a README, and asks before
+overwriting an existing file whose contents differ.
 
 The build prints one row per document:
 
