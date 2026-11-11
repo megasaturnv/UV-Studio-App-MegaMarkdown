@@ -180,20 +180,6 @@ TOOLCHAIN_ROOT=/path/to/project/.toolchain ./build.sh
 `app_overlay.h` instead of `../sdk`. The firmware's `compile-app.sh` also works
 if the SDK files and documents are copied alongside the app.
 
-## Renaming / making it your app
-
-1. Change `APP_NAME` and `APP_VER` in `markdown_viewer/build.sh`.
-2. Update the README title and the `MegaMarkdown` references.
-3. Replace the documents. If you use a different font width, change `LINE_COLS`
-   and `TINY_COLS` in `markdown_viewer/gen_assets.py`; `MD_ROWS` must stay 7,
-   because the LCD's top row is the separate status line and only seven rows
-   belong to the frame buffer. `TINY_ROWS` must stay 9 for the 3x5 font.
-4. Keep the LZSS constants in `lzss.py` and the generated header in sync; the
-   generator writes the header, so edit `lzss.py` only.
-
-The app name is shown on the radio and in UV Studio, is limited to 15
-characters, and must not match an official app.
-
 ## Portability
 
 - `.toolchain/` stays inside the directory on disk (gitignored), so a copy on
