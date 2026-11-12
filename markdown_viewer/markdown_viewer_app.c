@@ -471,12 +471,11 @@ static uint16_t max_top(void)
 
 static void status_list(void)
 {
-    char s[24];
+    char s[32];
     char *o = s;
 
-    o = put_text(o, "FILES ");
+    o = put_text(o, "MegaMarkdown - files ");
     o = put_u16(o, (uint16_t)MD_FILE_COUNT);
-    o = put_text(o, "  MENU=OPEN");
     *o = '\0';
     put_status(s);
 }
