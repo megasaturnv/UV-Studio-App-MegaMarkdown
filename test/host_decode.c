@@ -1,4 +1,4 @@
-/* Host-side smoke test for the LZSS decoder and line readers.
+/* Host-side smoke test for the Huffman decoder and line readers.
  *
  * Not part of the radio build.  It includes the app source so the static
  * decoder functions are visible, feeds the generated asset blob through a
@@ -65,7 +65,7 @@ int main(int argc, char **argv)
 
     for (uint8_t i = 0; i < MD_FILE_COUNT; i++) {
         unsigned rows = 0;
-        lz_start(&md_files[i]);
+        huff_start(&md_files[i]);
         int n;
         while ((n = reader_next_row(line, (uint8_t)sizeof line)) >= 0) {
             if (tiny_mode && strlen(line) > MD_TINY_COLS) {
@@ -76,7 +76,7 @@ int main(int argc, char **argv)
             printf("%s\n", line);
             rows++;
         }
-        if (lz.error) {
+        if (huff.error) {
             fprintf(stderr, "decode error in %s\n", md_files[i].name);
             return 1;
         }

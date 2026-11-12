@@ -14,10 +14,11 @@ With the amount of apps people are developing, I wanted a way to view their read
 ## Adding Markdown Files
 
 The documents live in [`markdown files/`](markdown%20files/). At build time each
-file is converted to 18-column display lines, compressed with a small LZSS
+file is converted to plain text paragraphs, compressed with a small Huffman
 codec, and packed into the app's read-only flash assets. The radio app then
-decompresses only the lines it draws. Press `0` in the reader to switch to the
-radio's 3x5 font, which reflows the same text to 32 columns and nine rows.
+decompresses only the text it draws and wraps it to the screen. Press `0` in the
+reader to switch between the normal 6x8 font (18 columns) and the radio's 3x5
+font (32 columns and nine rows).
 
 This project includes the ARM toolchain installer and an SDK fetch script, so a
 fresh checkout can build without cloning the firmware. It is also usable inside
@@ -52,10 +53,10 @@ a free slot, then open the Apps menu on the radio (`F` then `7`), select
 ├── markdown files/           source documents (*.md, *.markdown)
 │   └── download_armel_app_readmes.py  downloads app READMEs from the firmware repo
 ├── markdown_viewer/          the app itself
-│   ├── markdown_viewer_app.c entry point, list, reader, LZSS decoder
+│   ├── markdown_viewer_app.c entry point, list, reader, Huffman decoder
 │   ├── app.ld                linker script: everything in the 4 KiB overlay
-│   ├── gen_assets.py         Markdown -> display lines + tiny markers -> assets
-│   ├── lzss.py               compressor (the decoder is in the C file)
+│   ├── gen_assets.py         Markdown -> logical paragraphs -> compressed assets
+│   ├── huffman.py            compressor and code-length builder
 │   ├── build.sh              compile, link, pack
 │   ├── MegaMarkdown.app      build output (gitignored)
 │   └── markdown_assets.*     generated at build time (gitignored)
@@ -88,13 +89,15 @@ overwriting an existing file whose contents differ.
 The build prints one row per document:
 
 ```
-SOURCE                     TEXT  PACKED LINES  NAME
-about-viewer.md            1429    1069   100  ABOUT-VIEWER
-markdown-help.md           1094     894    84  MARKDOWN-HELP
-radio-notes.md             1338    1083   105  RADIO-NOTES
+SOURCE                     TEXT  PACKED  ROWS  TINY  NAME
+about-viewer.md            1895    1130   138    87  ABOUT-VIEWER
+markdown-help.md            571     358    50    40  MARKDOWN-HELP
+radio-notes.md             1373     860   112    77  RADIO-NOTES
 
-Assets: 3046 / 3840 B (79%)
+Assets: 2348 / 3840 B (61%)
 ```
+
+`ROWS` is the normal 18-column view; `TINY` is the 32-column 3x5 view.
 
 The asset area holds **3840 bytes** of compressed documents. If the total is
 larger, the build stops with the exact size; remove or trim documents and
@@ -114,9 +117,10 @@ Every source file is rendered at build time, not on the radio:
 | `---` | A line of dashes |
 | table rows | Cells joined with `|` |
 
-Long paragraphs are word-wrapped to 18 columns; a word longer than that is
-split. Non-ASCII characters become `?`, because the radio font covers printable
-ASCII.
+Each paragraph is word-wrapped at runtime to 18 columns (normal font) or 32
+columns (tiny font); a word longer than the width is split. Long paragraphs are
+stored in chunks that fit the 255-character line buffer. Non-ASCII characters
+become `?`, because the radio font covers printable ASCII.
 
 ## Controls
 
@@ -134,23 +138,21 @@ enabled; any key wakes the display and redraws it.
 
 ## Compression choice
 
-gzip/deflate compresses text better than LZSS, but an inflate decoder would take
-a large part of the 4 KiB overlay code budget. This app uses LZSS with a 1 KiB
-window and 16-bit tokens: the decoder is a few hundred bytes of C, and the
-window is the only large object in `.bss`. Measured on a 6.7 KiB text sample,
-gzip reached about 48% while this LZSS reached about 69%. On the bundled
-documents, 3711 bytes of normal-view text become 3046 bytes of assets; zlib
-would be about 2012 bytes. That 1034-byte asset saving is smaller than the code
-an inflate decoder would add, and this build has only 380 bytes of overlay
-headroom left. The LZSS trade-off leaves room for the viewer, the list and the
-tiny-font reflow; use larger source documents only if the compressed total
-stays under the limit.
+gzip/deflate compresses text slightly better, but an inflate decoder would take
+a large part of the 4 KiB overlay code budget. This app uses a static order-0
+Huffman code instead: one code-length table is built from all documents, the
+decoder walks a short canonical code per byte, and there is no ring window in
+`.bss`. On the bundled documents, 3839 bytes of logical text become 2348 bytes
+of assets (61%); raw deflate would be about 2157 bytes (56%). The 191-byte
+difference is not worth an inflate decoder, and the Huffman build leaves 1768
+bytes of overlay headroom. Use larger source documents only if the compressed
+total stays under the asset limit.
 
 ## Limits worth remembering
 
 - **4 KiB total** for code, constants, initialised data and `.bss` (the linker
-  assert enforces it). The current build uses 3716 B, including the LZSS window
-  and the tiny-font wrap buffer.
+  assert enforces it). The current build uses 2328 B, including the Huffman
+  tables and the runtime word-wrap buffer.
 - **Assets**: at most 3840 bytes, read with `asset_read()`; this app requires
   API level 2 for assets and API level 3 for the rest of its build.
 - **No firmware symbols and no C library**: only `libgcc` is linked. The app
@@ -195,7 +197,7 @@ if the SDK files and documents are copied alongside the app.
   vendored v6.3.0 headers.
 - `make test` runs a host-side decoder test: it decodes every generated stream
   in both the normal and tiny layouts. The normal output matches the Python
-  renderer exactly (289 lines), and the tiny layout decodes 201 rows without
+  renderer exactly (300 lines), and the tiny layout decodes 204 rows without
   errors or overlong lines.
 - `make test` uses a temporary patched `app_api.h` because the SDK's 32-bit
   layout asserts do not hold on a 64-bit host. The test copies the header to a

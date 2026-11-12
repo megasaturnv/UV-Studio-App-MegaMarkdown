@@ -1,7 +1,6 @@
 /*
  * MegaMarkdown overlay app: code, constants, initialised data and .bss all
- * share the 4 KiB overlay workspace.  The only large object is the LZSS
- * window, which is sized by MD_LZ_WINDOW_BITS.
+ * share the 4 KiB overlay workspace.
  */
 APP_VMA    = DEFINED(APP_VMA) ? APP_VMA : 0x20000280;
 APP_LENGTH = 0x1000;

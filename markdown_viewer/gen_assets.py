@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Build MegaMarkdown's read-only assets.
 
-Every *.md / *.markdown file in the source folder is converted to plain display
-lines (18 columns, matching the radio's 6x8 font), compressed with the small
-LZSS codec in lzss.py, and concatenated into one asset blob.  Continuation
-lines carry a marker so the app can reflow the same text to the 3x5 font's 32
-columns at runtime.  A generated header describes the files:
+Every *.md / *.markdown file in the source folder is converted to plain text
+paragraphs, compressed with the static Huffman codec in huffman.py, and
+concatenated into one asset blob.  The app wraps each decompressed paragraph to
+18 columns (6x8 font) or 32 columns (3x5 font) at runtime.  A generated header
+describes the files:
 
     markdown_assets.bin   compressed document streams, served by asset_read()
-    markdown_assets.h     per-file offsets/sizes/line counts and LZSS constants
+    markdown_assets.h     per-file offsets/sizes/row counts and Huffman tables
 
 Markdown is rendered here, at build time, because a runtime parser and a 4 KiB
 code limit do not mix.  The source files remain the editable source of truth;
@@ -20,7 +20,6 @@ Usage:  ./gen_assets.py <out.bin> <out.h>
 import os
 import re
 import sys
-import textwrap
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -28,8 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
-from lzss import (MIN_MATCH, LEN_BITS, OFFSET_BITS, WINDOW_BITS,
-                  compress, decompress)
+import huffman
 
 LINE_COLS = 18          # 128 px / (6 px glyph + 1 px gap)
 NAME_MAX = 16
@@ -43,15 +41,10 @@ ROWS = 7
 TINY_COLS = 32
 TINY_ROWS = 9
 
-# The tiny view rejoins wrapped lines before reflowing them.  Keep each joined
-# line below this size so the decoder's line buffer stays small.
+# A logical paragraph must fit the decoder's line buffer.
 WRAP_MAX = 255
 
-# Continuation markers stored at the start of an 18-column line.  SPACE means
-# the original text had whitespace at the break; HARD means a long word was
-# split.  The normal view strips the marker, the tiny view reflows the text.
-MARK_SPACE = "\x01"
-MARK_HARD = "\x02"
+# A horizontal rule is stored as a single marker byte.
 MARK_RULE = "\x03"
 
 DOC_SUFFIXES = {".md", ".markdown"}
@@ -99,9 +92,30 @@ def clean_inline(text):
 
 
 def _wrap(text, cols):
-    return textwrap.wrap(
-        text, width=cols, break_long_words=True,
-        break_on_hyphens=False, drop_whitespace=True)
+    """Greedy word wrap matching the C reader's row wrapper."""
+    lines = []
+    pos = 0
+    size = len(text)
+    while pos < size:
+        while pos < size and text[pos] == " ":
+            pos += 1
+        if pos >= size:
+            break
+
+        available = size - pos
+        take = available if available < cols else cols
+        if take < available:
+            cut = take
+            while cut > 0 and text[pos + cut] != " ":
+                cut -= 1
+            if cut > 0:
+                take = cut
+
+        lines.append(text[pos:pos + take])
+        pos += take
+        while pos < size and text[pos] == " ":
+            pos += 1
+    return lines
 
 
 def render_blocks(source):
@@ -200,6 +214,31 @@ def render_blocks(source):
     return blocks
 
 
+def _split_paragraph(text, limit):
+    """Split *text* into chunks that fit the runtime line buffer.
+
+    Chunks break at whitespace where possible.  Consecutive chunks are stored
+    as separate lines, so the runtime wrapper starts a new row after each one.
+    """
+    chunks = []
+    pos = 0
+    while pos < len(text):
+        end = min(len(text), pos + limit)
+        if end < len(text):
+            cut = end
+            while cut > pos and not text[cut].isspace():
+                cut -= 1
+            if cut > pos:
+                end = cut
+        chunk = text[pos:end]
+        if chunk:
+            chunks.append(chunk)
+        while end < len(text) and text[end].isspace():
+            end += 1
+        pos = end
+    return chunks
+
+
 def render_markdown(source, cols=LINE_COLS):
     """Return plain display lines wrapped to *cols* (used by the tests)."""
     lines = []
@@ -210,38 +249,19 @@ def render_markdown(source, cols=LINE_COLS):
         elif block[0] == "rule":
             lines.append("-" * cols)
         else:
-            lines.extend(_wrap(block[1], cols))
+            for chunk in _split_paragraph(block[1], WRAP_MAX):
+                lines.extend(_wrap(chunk, cols))
 
     while lines and lines[-1] == "":
         lines.pop()
     return lines
 
 
-def _markers(text, lines):
-    """Classify each break in *lines* as a whitespace or a hard-word break."""
-    markers = []
-    pos = 0
-    for index in range(len(lines) - 1):
-        found = text.find(lines[index], pos)
-        if found < 0:
-            # Defensive fallback; wrapped lines are substrings of text.
-            markers.append(MARK_SPACE)
-            continue
-        pos = found + len(lines[index])
-        after = pos
-        while after < len(text) and text[after].isspace():
-            after += 1
-        markers.append(MARK_SPACE if after > pos else MARK_HARD)
-        pos = after
-    return markers
-
-
 def render_assets(source):
-    """Return 18-column lines with continuation markers for the tiny view.
+    """Return one unwrapped logical line per Markdown block.
 
-    The normal reader draws these lines directly.  The tiny reader joins
-    continuation lines and reflows the text to TINY_COLS.  A marker is also
-    dropped when joining would exceed WRAP_MAX, bounding the decoder buffer.
+    The viewer wraps these lines at run time to 18 columns (normal font) or
+    32 columns (tiny font), so the stored text contains no line breaks.
     """
     stored = []
     for block in render_blocks(source):
@@ -251,26 +271,8 @@ def render_assets(source):
         if block[0] == "rule":
             stored.append(MARK_RULE)
             continue
-
-        text = block[1]
-        lines = _wrap(text, LINE_COLS)
-        if not lines:
-            continue
-        markers = _markers(text, lines)
-
-        stored.append(lines[0])
-        group_len = len(lines[0])
-        for index in range(1, len(lines)):
-            marker = markers[index - 1]
-            extra = len(lines[index]) + (1 if marker == MARK_SPACE else 0)
-            if group_len + extra > WRAP_MAX:
-                # Start a new logical line: the tiny view cannot join further
-                # without overflowing its wrap buffer.
-                stored.append(lines[index])
-                group_len = len(lines[index])
-            else:
-                stored.append(marker + lines[index])
-                group_len += extra
+        for chunk in _split_paragraph(block[1], WRAP_MAX):
+            stored.append(chunk)
     return stored
 
 
@@ -322,31 +324,49 @@ def main():
     blob = bytearray()
 
     print(f"Markdown sources: {folder}")
-    print(f"{'SOURCE':24} {'TEXT':>6} {'PACKED':>7} {'LINES':>5}  NAME")
+    print(f"{'SOURCE':24} {'TEXT':>6} {'PACKED':>7} {'ROWS':>5} {'TINY':>5}  NAME")
 
+    prepared = []
     for doc in docs:
         with open(doc, encoding="utf-8", errors="replace") as handle:
             source = handle.read()
         lines = render_assets(source)
+        rows18 = len(render_markdown(source, LINE_COLS))
+        rows32 = len(render_markdown(source, TINY_COLS))
         if not lines:
             print(f"  skipping empty document: {doc.name}")
             continue
         if len(lines) > 0xFFFF:
-            sys.exit(f"{doc.name}: {len(lines)} display lines exceed the "
+            sys.exit(f"{doc.name}: {len(lines)} stored lines exceed the "
                      "16-bit line counter")
         for line in lines:
-            content = line[1:] if line[:1] in (MARK_SPACE, MARK_HARD) else line
-            if len(content) > LINE_COLS:
+            if len(line) > WRAP_MAX:
                 sys.exit(f"{doc.name}: internal error, line is longer than "
-                         f"{LINE_COLS} columns")
+                         f"{WRAP_MAX} columns")
 
         text = ("\n".join(lines) + "\n").encode("ascii", "replace")
         if len(text) > 0xFFFF:
             sys.exit(f"{doc.name}: rendered text is {len(text)} B, over the "
                      "16-bit document length")
-        packed = compress(text)
-        if decompress(packed, len(text)) != text:
-            sys.exit(f"{doc.name}: LZSS self-test failed")
+        prepared.append({
+            "doc": doc,
+            "rows18": rows18,
+            "rows32": rows32,
+            "text": text,
+        })
+
+    if not prepared:
+        sys.exit("all documents were empty")
+
+    # One code-length table is shared by every document.
+    table = huffman.build_table([item["text"] for item in prepared])
+
+    for item in prepared:
+        doc = item["doc"]
+        text = item["text"]
+        packed = huffman.compress(text, table)
+        if huffman.decompress(packed, len(text), table) != text:
+            sys.exit(f"{doc.name}: Huffman self-test failed")
 
         name = display_name(doc, used_names)
         entries.append({
@@ -355,10 +375,12 @@ def main():
             "off": len(blob),
             "clen": len(packed),
             "ulen": len(text),
-            "lines": len(lines),
+            "lines": item["rows18"],
+            "trows": item["rows32"],
         })
         blob += packed
-        print(f"{doc.name:24} {len(text):6} {len(packed):7} {len(lines):5}  {name}")
+        print(f"{doc.name:24} {len(text):6} {len(packed):7} "
+              f"{item['rows18']:5} {item['rows32']:5}  {name}")
 
     if not entries:
         sys.exit("all documents were empty")
@@ -388,20 +410,17 @@ def main():
         f"#define MD_TINY_COLS {TINY_COLS}u",
         f"#define MD_TINY_ROWS {TINY_ROWS}u",
         f"#define MD_WRAP_MAX {WRAP_MAX}u",
-        f"#define MD_MARK_SPACE {ord(MARK_SPACE)}u",
-        f"#define MD_MARK_HARD {ord(MARK_HARD)}u",
         f"#define MD_MARK_RULE {ord(MARK_RULE)}u",
         f"#define MD_NAME_MAX {NAME_MAX}u",
-        f"#define MD_LZ_WINDOW_BITS {WINDOW_BITS}u",
-        f"#define MD_LZ_OFFSET_BITS {OFFSET_BITS}u",
-        f"#define MD_LZ_LEN_BITS {LEN_BITS}u",
-        f"#define MD_LZ_MIN_MATCH {MIN_MATCH}u",
+        f"#define MD_HUFF_MAX_BITS {table['max_bits']}u",
+        f"#define MD_HUFF_SYMBOLS {len(table['symbols'])}u",
         "",
         "typedef struct {",
         "    uint16_t off;",
         "    uint16_t clen;",
         "    uint16_t ulen;",
         "    uint16_t lines;",
+        "    uint16_t trows;",
         "    char name[MD_NAME_MAX + 1u];",
         "} md_file_t;",
         "",
@@ -411,9 +430,25 @@ def main():
         out.append(
             f"    /* {entry['source']} */ "
             f"{{ {entry['off']}u, {entry['clen']}u, {entry['ulen']}u, "
-            f"{entry['lines']}u, \"{entry['name']}\" }},")
+            f"{entry['lines']}u, {entry['trows']}u, \"{entry['name']}\" }},")
     out += [
         "};",
+        "",
+    ]
+
+    def c_array(name, ctype, values):
+        out.append(f"static const {ctype} {name}[] = {{")
+        for start in range(0, len(values), 12):
+            chunk = ", ".join(f"{value}u" for value in values[start:start + 12])
+            out.append(f"    {chunk},")
+        out.append("};")
+
+    c_array("md_huff_first", "uint16_t", table["first_code"])
+    c_array("md_huff_count", "uint8_t", table["count"])
+    c_array("md_huff_index", "uint8_t", table["first_index"])
+    c_array("md_huff_symbols", "uint8_t", table["symbols"])
+
+    out += [
         "",
         f"#endif /* {guard} */",
         "",

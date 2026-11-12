@@ -6,11 +6,12 @@
  *
  * Target: v6.3.0 ("Labs" / "Fusion_"), ABI 1, API level 3.
  *
- * The markdown files in ../markdown files are converted to 18-column display
- * lines and compressed at build time (see gen_assets.py).  The reader can
- * reflow those lines to the radio's 32-column 3x5 font.  This app only has to
- * open a file, decompress the next few lines, and draw them; it does not carry
- * a markdown parser or an inflate implementation in the 4 KiB overlay.
+ * The markdown files in ../markdown files are converted to plain paragraphs
+ * and compressed at build time (see gen_assets.py).  The reader wraps each
+ * paragraph to 18 columns (6x8 font) or 32 columns (3x5 font) at runtime.
+ * This app only has to open a file, decompress the next paragraph, and draw
+ * the rows it needs; it does not carry a markdown parser or an inflate
+ * implementation in the 4 KiB overlay.
  *
  * Keys:
  *   file list:  UP/DOWN (or LEFT/RIGHT)  previous/next file
@@ -40,49 +41,36 @@ _Static_assert(MD_ASSET_SIZE <= APP_ASSET_MAX,
 
 #define TICK_MS 20u
 
-#define MD_WINDOW_SIZE  (1u << MD_LZ_WINDOW_BITS)
-#define MD_WINDOW_MASK  (MD_WINDOW_SIZE - 1u)
-#define MD_OFFSET_MASK  ((1u << MD_LZ_OFFSET_BITS) - 1u)
-
 enum {
     MODE_LIST = 0,
     MODE_READ,
 };
 
-/* One decompressor instance, kept in .bss so its ring buffer does not sit on
- * the radio's stack.  The window must be a power of two. */
+/* One decompressor instance, kept in .bss so its input buffer does not sit on
+ * the radio's stack. */
 typedef struct {
     uint16_t src_pos;
     uint16_t src_left;
     uint8_t  src_buf[32];
     uint8_t  src_buf_pos;
     uint8_t  src_buf_left;
-    uint8_t  flags;
-    uint8_t  flags_left;
-    uint8_t  match_left;
-    uint16_t match_dist;
+    uint8_t  bits;
+    uint8_t  bits_left;
     uint16_t out_left;
-    uint16_t produced;
-    uint16_t win_pos;
     bool     error;
-    uint8_t  window[MD_WINDOW_SIZE];
-} lz_t;
+} huff_t;
 
-static lz_t lz;
+static huff_t huff;
 
-/* Tiny-font reflow state.  The asset stores 18-column lines with markers at
- * the start of wrapped continuations; this joins them into one logical line
- * and re-wraps it to MD_TINY_COLS. */
+/* Runtime word-wrap state.  The asset stores one unwrapped logical line per
+ * Markdown block; this walks it and emits rows for the selected font width. */
 typedef struct {
-    char     logical[MD_WRAP_MAX + 1u];
-    char     pending[MD_LINE_MAX + 2u];
-    uint8_t  logical_len;
-    uint8_t  pos;
-    uint8_t  pending_len;
-    bool     have_pending;
-} tiny_t;
+    char     line[MD_WRAP_MAX + 1u];
+    uint16_t len;
+    uint16_t pos;
+} wrap_t;
 
-static tiny_t tiny;
+static wrap_t wrap;
 
 typedef struct {
     uint8_t  mode;
@@ -122,244 +110,136 @@ uint64_t __aeabi_uidivmod(uint32_t n, uint32_t d)
 uint64_t __aeabi_uidiv(uint32_t n, uint32_t d) __attribute__((alias("__aeabi_uidivmod")));
 
 /* -------------------------------------------------------------------------- */
-/*  LZSS decoder                                                              */
+/*  Huffman decoder                                                           */
 /* -------------------------------------------------------------------------- */
 
-static uint8_t lz_comp_byte(void)
+static uint8_t huff_comp_byte(void)
 {
-    if (!lz.src_buf_left) {
-        if (!lz.src_left) {
-            lz.error = true;
+    if (!huff.src_buf_left) {
+        if (!huff.src_left) {
+            huff.error = true;
             return 0;
         }
-        const uint16_t want = lz.src_left > sizeof lz.src_buf
-                            ? (uint16_t)sizeof lz.src_buf : lz.src_left;
-        const uint16_t got = A->asset_read(lz.src_pos, lz.src_buf, want);
+        const uint16_t want = huff.src_left > sizeof huff.src_buf
+                            ? (uint16_t)sizeof huff.src_buf : huff.src_left;
+        const uint16_t got = A->asset_read(huff.src_pos, huff.src_buf, want);
         if (got != want) {
-            lz.error = true;
+            huff.error = true;
             return 0;
         }
-        lz.src_pos = (uint16_t)(lz.src_pos + want);
-        lz.src_left = (uint16_t)(lz.src_left - want);
-        lz.src_buf_pos = 0;
-        lz.src_buf_left = (uint8_t)want;
+        huff.src_pos = (uint16_t)(huff.src_pos + want);
+        huff.src_left = (uint16_t)(huff.src_left - want);
+        huff.src_buf_pos = 0;
+        huff.src_buf_left = (uint8_t)want;
     }
-    lz.src_buf_left--;
-    return lz.src_buf[lz.src_buf_pos++];
+    huff.src_buf_left--;
+    return huff.src_buf[huff.src_buf_pos++];
 }
 
-static void lz_emit(uint8_t c)
+static int huff_next(void)
 {
-    lz.window[lz.win_pos] = c;
-    lz.win_pos = (uint16_t)((lz.win_pos + 1u) & MD_WINDOW_MASK);
-    lz.out_left--;
-    lz.produced++;
-}
+    if (!huff.out_left)
+        return -1;
 
-static int lz_next(void)
-{
-    while (!lz.match_left) {
-        if (!lz.out_left)
-            return -1;
-
-        if (!lz.flags_left) {
-            lz.flags = lz_comp_byte();
-            if (lz.error)
+    uint16_t code = 0;
+    for (uint8_t length = 1; length <= MD_HUFF_MAX_BITS; length++) {
+        if (!huff.bits_left) {
+            huff.bits = huff_comp_byte();
+            if (huff.error)
                 return -1;
-            lz.flags_left = 8;
+            huff.bits_left = 8;
         }
+        code = (uint16_t)((code << 1) | (huff.bits >> 7));
+        huff.bits = (uint8_t)(huff.bits << 1);
+        huff.bits_left--;
 
-        if (lz.flags & 1u) {
-            lz.flags >>= 1;
-            lz.flags_left--;
-            const uint8_t c = lz_comp_byte();
-            if (lz.error)
-                return -1;
-            lz_emit(c);
-            return c;
+        const uint16_t first = md_huff_first[length];
+        if (code >= first) {
+            const uint16_t index = (uint16_t)(code - first);
+            if (index < md_huff_count[length]) {
+                huff.out_left--;
+                return md_huff_symbols[md_huff_index[length] + index];
+            }
         }
-
-        lz.flags >>= 1;
-        lz.flags_left--;
-        uint16_t token = lz_comp_byte();
-        token |= (uint16_t)lz_comp_byte() << 8;
-        if (lz.error)
-            return -1;
-
-        lz.match_dist = (uint16_t)((token & MD_OFFSET_MASK) + 1u);
-        lz.match_left = (uint8_t)((token >> MD_LZ_OFFSET_BITS) + MD_LZ_MIN_MATCH);
-        if (lz.match_dist > lz.produced) {
-            lz.error = true;
-            return -1;
-        }
-        if (lz.match_left > lz.out_left)
-            lz.match_left = (uint8_t)lz.out_left;
     }
 
-    const uint16_t index =
-        (uint16_t)(lz.win_pos - lz.match_dist) & (uint16_t)MD_WINDOW_MASK;
-    const uint8_t c = lz.window[index];
-    lz.match_left--;
-    lz_emit(c);
-    return c;
+    huff.error = true;
+    return -1;
 }
 
-static void lz_start(const md_file_t *file)
+static void huff_start(const md_file_t *file)
 {
-    lz.src_pos = file->off;
-    lz.src_left = file->clen;
-    lz.src_buf_pos = 0;
-    lz.src_buf_left = 0;
-    lz.flags = 0;
-    lz.flags_left = 0;
-    lz.match_left = 0;
-    lz.out_left = file->ulen;
-    lz.produced = 0;
-    lz.win_pos = 0;
-    lz.error = false;
+    huff.src_pos = file->off;
+    huff.src_left = file->clen;
+    huff.src_buf_pos = 0;
+    huff.src_buf_left = 0;
+    huff.bits = 0;
+    huff.bits_left = 0;
+    huff.out_left = file->ulen;
+    huff.error = false;
 
-    tiny.logical_len = 0;
-    tiny.pos = 0;
-    tiny.pending_len = 0;
-    tiny.have_pending = false;
+    wrap.len = 0;
+    wrap.pos = 0;
 }
 
 /* Return one line, or -1 at end of document / on a corrupt stream.  An empty
  * line returns 0, which is different from end of document. */
-static int lz_read_line(char *dst, uint8_t size)
+static int huff_read_line(char *dst, uint16_t size)
 {
-    uint8_t n = 0;
+    uint16_t n = 0;
     int c;
 
-    while ((c = lz_next()) >= 0) {
+    while ((c = huff_next()) >= 0) {
         if (c == '\n') {
             dst[n] = '\0';
             return (int)n;
         }
-        if ((uint8_t)(n + 1u) < size)
+        if (n + 1u < size)
             dst[n++] = (char)c;
     }
     dst[n] = '\0';
     return n ? (int)n : -1;
 }
 
-/* Normal (6x8) rows are stored directly; strip the continuation marker. */
-static int normal_next_row(char *dst, uint8_t size)
+/* Wrap the current logical line to the selected font width. */
+static int reader_next_row(char *dst, uint8_t size)
 {
-    const int n = lz_read_line(dst, size);
-    if (n <= 0)
-        return n;
-
-    if (dst[0] == MD_MARK_RULE) {
-        for (uint8_t i = 0; i < MD_LINE_MAX; i++)
-            dst[i] = '-';
-        dst[MD_LINE_MAX] = '\0';
-        return MD_LINE_MAX;
-    }
-    if (dst[0] == MD_MARK_SPACE || dst[0] == MD_MARK_HARD) {
-        for (uint8_t i = 1; i <= (uint8_t)n; i++)
-            dst[i - 1u] = dst[i];
-        return n - 1;
-    }
-    return n;
-}
-
-static int tiny_raw(char *dst, uint8_t size)
-{
-    if (tiny.have_pending) {
-        tiny.have_pending = false;
-        uint8_t n = tiny.pending_len;
-        if (n >= size)
-            n = (uint8_t)(size - 1u);
-        for (uint8_t i = 0; i <= n; i++)
-            dst[i] = tiny.pending[i];
-        return (int)n;
-    }
-    return lz_read_line(dst, size);
-}
-
-/* Return one logical line with its continuations joined, or 0 for a blank
- * line, or -1 at end of document. */
-static int tiny_read_logical(void)
-{
-    char line[MD_LINE_MAX + 2u];
-    int n = tiny_raw(line, (uint8_t)sizeof line);
-
-    if (n < 0)
-        return -1;
-    if (n == 0)
-        return 0;
-
-    if (line[0] == MD_MARK_RULE) {
-        tiny.logical_len = MD_TINY_COLS;
-        for (uint8_t i = 0; i < MD_TINY_COLS; i++)
-            tiny.logical[i] = '-';
-        tiny.logical[tiny.logical_len] = '\0';
-        return tiny.logical_len;
-    }
-
-    uint8_t start = 0;
-    if (line[0] == MD_MARK_SPACE || line[0] == MD_MARK_HARD)
-        start = 1;
-
-    tiny.logical_len = 0;
-    for (uint8_t i = start; line[i] && tiny.logical_len < MD_WRAP_MAX; i++)
-        tiny.logical[tiny.logical_len++] = line[i];
+    const uint8_t cols = g.tiny ? MD_TINY_COLS : MD_LINE_MAX;
 
     for (;;) {
-        n = tiny_raw(line, (uint8_t)sizeof line);
-        if (n < 0)
-            break;
-        if (n == 0) {
-            tiny.pending[0] = '\0';
-            tiny.pending_len = 0;
-            tiny.have_pending = true;
-            break;
-        }
-        if (line[0] == MD_MARK_SPACE || line[0] == MD_MARK_HARD) {
-            if (line[0] == MD_MARK_SPACE && tiny.logical_len < MD_WRAP_MAX)
-                tiny.logical[tiny.logical_len++] = ' ';
-            for (uint8_t i = 1; line[i] && tiny.logical_len < MD_WRAP_MAX; i++)
-                tiny.logical[tiny.logical_len++] = line[i];
-            continue;
-        }
-        tiny.pending_len = (uint8_t)n;
-        for (uint8_t i = 0; i <= (uint8_t)n; i++)
-            tiny.pending[i] = line[i];
-        tiny.have_pending = true;
-        break;
-    }
-
-    tiny.logical[tiny.logical_len] = '\0';
-    return tiny.logical_len ? (int)tiny.logical_len : 0;
-}
-
-/* Greedy word wrap to MD_TINY_COLS, mirroring the build-time renderer. */
-static int tiny_next_row(char *dst, uint8_t size)
-{
-    for (;;) {
-        if (tiny.pos >= tiny.logical_len) {
-            const int n = tiny_read_logical();
+        if (wrap.pos >= wrap.len) {
+            const int n = huff_read_line(wrap.line,
+                                       (uint16_t)sizeof wrap.line);
             if (n < 0)
                 return -1;
-            if (n == 0) {
+
+            wrap.len = (uint16_t)n;
+            wrap.pos = 0;
+            if (!n) {
                 dst[0] = '\0';
                 return 0;
             }
-            tiny.pos = 0;
+            if ((uint8_t)wrap.line[0] == MD_MARK_RULE) {
+                uint8_t i = 0;
+                while (i < cols && (uint8_t)(i + 1u) < size)
+                    dst[i] = '-', i++;
+                dst[i] = '\0';
+                wrap.pos = wrap.len;
+                return (int)i;
+            }
         }
 
-        uint8_t start = tiny.pos;
-        while (start < tiny.logical_len && tiny.logical[start] == ' ')
+        uint16_t start = wrap.pos;
+        while (start < wrap.len && wrap.line[start] == ' ')
             start++;
-        tiny.pos = start;
+        wrap.pos = start;
 
-        const uint8_t avail = (uint8_t)(tiny.logical_len - start);
-        uint8_t take = avail > MD_TINY_COLS ? MD_TINY_COLS : avail;
+        const uint16_t avail = (uint16_t)(wrap.len - start);
+        uint16_t take = avail > cols ? cols : avail;
 
         if (take < avail) {
-            uint8_t cut = take;
-            while (cut > 0 && tiny.logical[start + cut] != ' ')
+            uint16_t cut = take;
+            while (cut > 0 && wrap.line[start + cut] != ' ')
                 cut--;
             if (cut > 0)
                 take = cut;
@@ -367,21 +247,14 @@ static int tiny_next_row(char *dst, uint8_t size)
 
         uint8_t n = 0;
         while (n < take && (uint8_t)(n + 1u) < size)
-            dst[n] = tiny.logical[start + n], n++;
+            dst[n] = wrap.line[start + n], n++;
         dst[n] = '\0';
 
-        tiny.pos = (uint8_t)(start + take);
-        while (tiny.pos < tiny.logical_len && tiny.logical[tiny.pos] == ' ')
-            tiny.pos++;
+        wrap.pos = (uint16_t)(start + take);
+        while (wrap.pos < wrap.len && wrap.line[wrap.pos] == ' ')
+            wrap.pos++;
         return (int)n;
     }
-}
-
-static int reader_next_row(char *dst, uint8_t size)
-{
-    if (g.tiny)
-        return tiny_next_row(dst, size);
-    return normal_next_row(dst, size);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -443,20 +316,10 @@ static uint8_t row_count(void)
     return g.tiny ? MD_TINY_ROWS : MD_ROWS;
 }
 
-static uint16_t count_rows(void)
-{
-    char line[MD_TINY_COLS + 1u];
-    uint16_t rows = 0;
-
-    lz_start(&md_files[g.selected]);
-    while (reader_next_row(line, (uint8_t)sizeof line) >= 0)
-        rows++;
-    return rows;
-}
-
 static void update_total_rows(void)
 {
-    g.total_rows = g.tiny ? count_rows() : md_files[g.selected].lines;
+    const md_file_t *file = &md_files[g.selected];
+    g.total_rows = g.tiny ? file->trows : file->lines;
 }
 
 static uint16_t max_top(void)
@@ -529,7 +392,7 @@ static void draw_reader(void)
     uint16_t skip = g.top;
 
     begin_frame();
-    lz_start(&md_files[g.selected]);
+    huff_start(&md_files[g.selected]);
 
     while (skip) {
         if (reader_next_row(line, (uint8_t)sizeof line) < 0)
@@ -549,7 +412,7 @@ static void draw_reader(void)
             A->print_normal(line, 0, 0, row);
     }
 
-    if (lz.error)
+    if (huff.error)
         put_status("DOCUMENT ERROR");
     else
         status_reader();
